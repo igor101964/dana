@@ -36,15 +36,85 @@ def check_limit(cmd, days):
 
 # ── Fetchers ──────────────────────────────────────────────────────────
 
-def fetch_weather(city="London", days=7):
+# ── US state abbreviation → full name (for Open-Meteo admin1 matching) ──
+US_STATES = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas",
+    "CA":"California","CO":"Colorado","CT":"Connecticut","DE":"Delaware",
+    "FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho",
+    "IL":"Illinois","IN":"Indiana","IA":"Iowa","KS":"Kansas",
+    "KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland",
+    "MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
+    "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada",
+    "NH":"New Hampshire","NJ":"New Jersey","NM":"New Mexico","NY":"New York",
+    "NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
+    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina",
+    "SD":"South Dakota","TN":"Tennessee","TX":"Texas","UT":"Utah",
+    "VT":"Vermont","VA":"Virginia","WA":"Washington","WV":"West Virginia",
+    "WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia",
+}
+
+def parse_city_qualifier(city_str):
+    """Split 'City,Qualifier' into (city_name, qualifier).
+
+    Qualifier can be:
+      - US state abbreviation:  "Springfield,IL"  -> qualifier="IL" (-> "Illinois")
+      - ISO2 country code:      "Paris,FR"         -> qualifier="FR"
+      - Full state/region name: "Paris,Texas"      -> qualifier="Texas"
+
+    Returns (name, qualifier_or_None).
+    Underscores in city name already converted to spaces before this call.
+    """
+    if ',' not in city_str:
+        return city_str.strip(), None
+    parts = city_str.split(',', 1)
+    name      = parts[0].strip()
+    qualifier = parts[1].strip()
+    return name, qualifier if qualifier else None
+
+def geocode_city(city_str):
+    """Resolve city string (possibly with ,State or ,CC qualifier) to
+    (latitude, longitude, display_name).
+
+    Disambiguation strategy:
+      1. Fetch up to 10 candidates from Open-Meteo geocoding.
+      2. If a qualifier is given, try to match it against:
+         - country_code (2-letter ISO, case-insensitive)
+         - admin1 (region/state name, substring match, case-insensitive)
+         - US state abbrev expanded to full name
+      3. First matching result wins; fall back to results[0] if no match.
+    """
+    name, qualifier = parse_city_qualifier(city_str)
     geo_url = (f"https://geocoding-api.open-meteo.com/v1/search"
-               f"?name={urllib.parse.quote(city)}&count=1")
+               f"?name={urllib.parse.quote(name)}&count=10&language=en")
     with urllib.request.urlopen(geo_url, timeout=10) as r:
         geo = json.loads(r.read())
     if not geo.get("results"):
-        raise ValueError(f"City not found: {city}")
-    res  = geo["results"][0]
-    lat, lon, name = res["latitude"], res["longitude"], res["name"]
+        raise ValueError(f"City not found: {city_str!r}")
+    results = geo["results"]
+    best = results[0]  # default: first result
+    if qualifier:
+        q = qualifier.upper()
+        # expand US state abbrev
+        q_full = US_STATES.get(q, qualifier).lower()
+        q_lower = qualifier.lower()
+        for res in results:
+            cc     = (res.get("country_code") or "").upper()
+            admin1 = (res.get("admin1") or "").lower()
+            if cc == q or q_lower in admin1 or q_full in admin1:
+                best = res
+                break
+    lat  = best["latitude"]
+    lon  = best["longitude"]
+    # Build a readable display name: City, State/Region, Country
+    parts = [best.get("name","")]
+    if best.get("admin1"): parts.append(best["admin1"])
+    if best.get("country"): parts.append(best["country"])
+    display = ", ".join(p for p in parts if p)
+    return lat, lon, display
+
+
+def fetch_weather(city="London", days=7):
+    lat, lon, name = geocode_city(city)
 
     imperial = (g_units == "imperial")
     temp_unit   = "fahrenheit" if imperial else "celsius"
@@ -78,14 +148,7 @@ def fetch_weather(city="London", days=7):
             "wind_label":wind_label}
 
 def fetch_airquality(city="London"):
-    geo_url = (f"https://geocoding-api.open-meteo.com/v1/search"
-               f"?name={urllib.parse.quote(city)}&count=1")
-    with urllib.request.urlopen(geo_url, timeout=10) as r:
-        geo = json.loads(r.read())
-    if not geo.get("results"):
-        raise ValueError(f"City not found: {city}")
-    res  = geo["results"][0]
-    lat, lon, name = res["latitude"], res["longitude"], res["name"]
+    lat, lon, name = geocode_city(city)
     url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?"
            f"latitude={lat}&longitude={lon}"
            f"&hourly=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,ozone"
@@ -143,9 +206,16 @@ def fetch_stock(sym="AAPL", days=30):
     return {"type":"stock","title":f"{sym.upper()} stock price (USD)",
             "dates":dates,"values":values,"volumes":volumes,"sym":sym.upper()}
 
-def fetch_gdp(countries_str, years=20):
-    """World Bank GDP data"""
-    countries = [c.strip() for c in countries_str.replace(",","").split()]
+def fetch_gdp(countries_input, years=20):
+    """World Bank GDP data.
+    countries_input: list of country name strings (may be multi-word, e.g. "South Korea")
+    or legacy string (space/comma separated) for backward compatibility.
+    """
+    if isinstance(countries_input, list):
+        # normalize: strip commas, replace underscores (belt-and-suspenders)
+        countries = [c.strip().replace(",","").replace("_"," ") for c in countries_input if c.strip()]
+    else:
+        countries = [c.strip() for c in countries_input.replace(",","").split()]
     # country name -> ISO2 code mapping (common ones)
     name_to_iso = {
         "usa":"US","us":"US","unitedstates":"US","america":"US",
@@ -183,11 +253,11 @@ def fetch_gdp(countries_str, years=20):
         "colombia":"CO","co":"CO",
         "chile":"CL","cl":"CL",
         "nigeria":"NG","ng":"NG",
-        "southafrica":"ZA","za":"ZA",
+        "southafrica":"ZA","south africa":"ZA","za":"ZA",
         "egypt":"EG","eg":"EG",
         "iran":"IR","ir":"IR",
-        "saudiarabia":"SA","sa":"SA","saudi":"SA",
-        "uae":"AE","ae":"AE",
+        "saudiarabia":"SA","saudi arabia":"SA","sa":"SA","saudi":"SA",
+        "uae":"AE","united arab emirates":"AE","ae":"AE",
         "singapore":"SG","sg":"SG",
         "taiwan":"TW","tw":"TW",
         "thailand":"TH","th":"TH",
@@ -196,17 +266,32 @@ def fetch_gdp(countries_str, years=20):
         "philippines":"PH","ph":"PH",
         "pakistan":"PK","pk":"PK",
         "bangladesh":"BD","bd":"BD",
+        # multi-word variants (work when quoted or underscored)
+        "united states":"US","united kingdom":"GB",
+        "south korea":"KR","north korea":"KP","kp":"KP",
+        "new zealand":"NZ","nz":"NZ",
+        "czech republic":"CZ","czechrepublic":"CZ",
+        "european union":"EU",
+        "costa rica":"CR","cr":"CR",
+        "puerto rico":"PR","pr":"PR",
+        "hong kong":"HK","hk":"HK",
+        "el salvador":"SV","sv":"SV",
+        "sri lanka":"LK","lk":"LK",
+        "ivory coast":"CI","ci":"CI",
+        "new guinea":"PG","pg":"PG",
     }
     # EU alias — top 6 EU economies
     eu_countries = ["DE","FR","IT","ES","NL","PL"]
 
     iso_codes = []
     for c in countries:
-        cl = c.lower()
-        if cl in ("eu","europe","european","europeanunion"):
+        cl = c.lower().strip()
+        if cl in ("eu","europe","european","europeanunion","european union"):
             iso_codes.extend(eu_countries)
         else:
-            iso = name_to_iso.get(cl, c.upper()[:2])
+            # try exact (preserves spaces for "south korea" etc.)
+            # then try with spaces removed (legacy "southkorea")
+            iso = name_to_iso.get(cl) or name_to_iso.get(cl.replace(" ","")) or c.upper()[:2]
             iso_codes.append(iso)
 
     end_year  = datetime.now().year - 1
@@ -715,19 +800,36 @@ def multi_chart_html(traces_data, title, y_title=""):
                        config={"responsive": True, "scrollZoom": True,
                                "modeBarButtonsToAdd": ["hoverCompareCartesian"]})
 
-def split_args(parts, cmd):
-    """Split parts into list of items and optional trailing int (days/years).
-    e.g. ['stock','AAPL','TSLA','NVDA','90'] -> (['AAPL','TSLA','NVDA'], 90)
+def parse_query_tail(tail_str):
+    """Parse the part of a query after the command word.
+
+    Supports three ways to write multi-word names:
+      - double quotes:   "San Francisco"
+      - underscores:     San_Francisco   (converted to spaces)
+      - bare words:      London  (single word, unchanged)
+
+    Mixed example:
+      weather "San Francisco" Moscow New_York Paris 30
+
+    Returns (list_of_tokens, days_or_None).
     """
-    args = parts[1:]
+    import shlex
+    try:
+        tokens = shlex.split(tail_str)
+    except ValueError:
+        # Unmatched quotes – fall back to plain split
+        tokens = tail_str.split()
+    # underscore → space (after shlex so quoted strings are already clean)
+    tokens = [t.replace('_', ' ') for t in tokens]
     days = None
-    if args:
+    if tokens:
         try:
-            days = int(args[-1])
-            args = args[:-1]
+            days = int(tokens[-1])
+            tokens = tokens[:-1]
         except ValueError:
             pass
-    return args, days
+    return tokens, days
+
 
 KNOWN_REGIONS = [
     "Europe","USA","Asia","Japan","China","Russia",
@@ -767,7 +869,12 @@ def nice_error_html(title, message, hint=None):
 def handle(query):
     global g_units, g_lang, _last_raw_data
     _last_raw_data = None
-    parts = query.strip().split()
+
+    import shlex as _shlex
+    try:
+        parts = _shlex.split(query.strip())
+    except ValueError:
+        parts = query.strip().split()
     if not parts: raise ValueError("Empty query")
 
     # Parse optional prefixes: units=imperial lang=Russian
@@ -778,10 +885,14 @@ def handle(query):
 
     if not parts: raise ValueError("Empty query after options")
     cmd = parts[0].lower()
+    # Rebuild tail preserving multi-word tokens (from quoted input)
+    _tail = " ".join(
+        ('"' + t + '"' if ' ' in t else t) for t in parts[1:]
+    )
 
     # ── stock ──────────────────────────────────────────────────────────
     if cmd in ("stock", "stocks"):
-        args, days = split_args(parts, cmd)
+        args, days = parse_query_tail(_tail)
         days = days or 30
         check_limit("stock", days)
         syms = [a.upper() for a in args] if args else ["AAPL"]
@@ -817,7 +928,7 @@ def handle(query):
 
     # ── crypto ─────────────────────────────────────────────────────────
     elif cmd == "crypto":
-        args, days = split_args(parts, cmd)
+        args, days = parse_query_tail(_tail)
         days = days or 30
         check_limit("crypto", days)
         coins = [a.lower() for a in args] if args else ["bitcoin"]
@@ -851,7 +962,7 @@ def handle(query):
 
     # ── weather ────────────────────────────────────────────────────────
     elif cmd == "weather":
-        args, days = split_args(parts, cmd)
+        args, days = parse_query_tail(_tail)
         days = days or 7
         check_limit("weather", days)
         cities = args if args else ["London"]
@@ -879,7 +990,7 @@ def handle(query):
 
     # ── currency ───────────────────────────────────────────────────────
     elif cmd == "currency":
-        args, days = split_args(parts, cmd)
+        args, days = parse_query_tail(_tail)
         days = days or 30
         check_limit("currency", days)
         if not args:
@@ -911,7 +1022,7 @@ def handle(query):
 
     # ── airquality ─────────────────────────────────────────────────────
     elif cmd in ("airquality", "air", "aqi"):
-        args, days = split_args(parts, cmd)
+        args, days = parse_query_tail(_tail)
         days = days or 3
         check_limit("airquality", days)
         cities = args if args else ["London"]
@@ -939,18 +1050,17 @@ def handle(query):
 
     # ── gdp ────────────────────────────────────────────────────────────
     elif cmd == "gdp":
-        try:
-            years = int(parts[-1])
-            countries = " ".join(parts[1:-1])
-        except ValueError:
-            years = 20
-            countries = " ".join(parts[1:])
+        args, years = parse_query_tail(_tail)
+        years = years or 20
         check_limit("gdp", years)
+        # args is a list of country tokens (may be multi-word after quote/underscore parsing)
+        countries = args if args else ["usa"]
         d = fetch_gdp(countries, years); _last_raw_data = d; return build_chart(d)
 
     # ── maps ───────────────────────────────────────────────────────────
     elif cmd == "flights":
-        region = parts[1] if len(parts) > 1 else "Europe"
+        _fargs, _ = parse_query_tail(_tail)
+        region = _fargs[0] if _fargs else "Europe"
         known = [r.lower() for r in KNOWN_REGIONS]
         if region.lower() not in known:
             suggestion = suggest_region(region)
@@ -963,7 +1073,8 @@ def handle(query):
         return build_map(d)
 
     elif cmd in ("weathermap", "wmap"):
-        region = parts[1] if len(parts) > 1 else "Europe"
+        _wargs, _ = parse_query_tail(_tail)
+        region = _wargs[0] if _wargs else "Europe"
         return build_map(fetch_weathermap(region))
 
     else:

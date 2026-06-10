@@ -17,8 +17,14 @@
 #include <sys/wait.h>
 
 /* ── Config ─────────────────────────────────────────────────────────── */
-#define DANA_WORKER  "/home/igor/dana/dana_worker.py"
-#define LAST_DATA    "/home/igor/dana/last_data.json"
+#ifndef DANA_WORKER_PATH
+#define DANA_WORKER_PATH "/home/igor/dana/dana_worker.py"
+#endif
+#ifndef DANA_LAST_DATA_PATH
+#define DANA_LAST_DATA_PATH "/home/igor/dana/last_data.json"
+#endif
+#define DANA_WORKER DANA_WORKER_PATH
+#define LAST_DATA   DANA_LAST_DATA_PATH
 #define APP_TITLE    "dana \xe2\x80\x94 Data Analysis Viewer"
 #define APP_W        1200
 #define APP_H        780
@@ -663,13 +669,13 @@ const char HELP_HTML[] =
 "<div class='ex'>currency GBP JPY 60 &nbsp;&middot;&nbsp; currency USD RUB 90</div></div></div>"
 "<div class='cmd'><div class='c'><code>weather London 14</code></div>"
 "<div><div class='d'>Temperature + precipitation <span class='tag'>Open-Meteo</span></div>"
-"<div class='ex'>weather Tokyo 7 &nbsp;&middot;&nbsp; weather Moscow 30</div></div></div>"
+"<div class='ex'>weather Tokyo 7 &nbsp;&middot;&nbsp; weather Moscow 30 &nbsp;&middot;&nbsp; weather &#34;San Francisco,CA&#34; 14 &nbsp;&middot;&nbsp; weather &#34;Springfield,IL&#34;</div></div></div>"
 "<div class='cmd'><div class='c'><code>gdp China USA 20</code></div>"
 "<div><div class='d'>GDP by year <span class='tag'>World Bank</span></div>"
 "<div class='ex'>gdp Germany France Italy 30</div></div></div>"
 "<div class='cmd'><div class='c'><code>airquality Paris</code></div>"
 "<div><div class='d'>Air quality + pollutants <span class='tag'>Open-Meteo</span></div>"
-"<div class='ex'>airquality Beijing &nbsp;&middot;&nbsp; airquality London</div></div></div>"
+"<div class='ex'>airquality Beijing &nbsp;&middot;&nbsp; airquality London &nbsp;&middot;&nbsp; airquality &#34;Los Angeles,CA&#34;</div></div></div>"
 "<hr>"
 "<h2>&#x1F4CA; Charts &mdash; comparison (multiple items)</h2>"
 "<div class='cmd'><div class='c'><code>stock AAPL TSLA NVDA 90</code></div>"
@@ -677,7 +683,7 @@ const char HELP_HTML[] =
 "<div class='cmd'><div class='c'><code>crypto bitcoin ethereum solana 60</code></div>"
 "<div class='d'>Normalised to base 100</div></div>"
 "<div class='cmd'><div class='c'><code>weather London Paris Berlin 14</code></div>"
-"<div class='d'>Max temperature comparison</div></div>"
+"<div class='d'>Max temperature comparison &mdash; e.g. <code>weather &#34;San Francisco,CA&#34; Moscow &#34;New York,NY&#34; 30</code></div></div>"
 "<div class='cmd'><div class='c'><code>currency USD EUR GBP JPY 30</code></div>"
 "<div class='d'>Multiple targets vs base</div></div>"
 "<hr>"
@@ -725,15 +731,15 @@ const char HELP_HTML[] =
 "</tr>"
 "<tr style='border-bottom:1px solid #313244'>"
 "  <td style='padding:4px 8px'><code>weather</code></td>"
-"  <td style='padding:4px 8px'>weather CITY [days]</td>"
+"  <td style='padding:4px 8px'>weather CITY[,State|CC] [days]</td>"
 "  <td style='padding:4px 8px'>1–92 days</td>"
-"  <td style='padding:4px 8px'>Any city name: London Tokyo Moscow Paris Berlin NYC Sydney Dubai</td>"
+"  <td style='padding:4px 8px'>London &nbsp; Tokyo &nbsp; &#34;San Francisco,CA&#34; &nbsp; &#34;Springfield,IL&#34; &nbsp; &#34;Paris,FR&#34; &nbsp; &#34;Paris,TX&#34;</td>"
 "</tr>"
 "<tr style='border-bottom:1px solid #313244'>"
 "  <td style='padding:4px 8px'><code>airquality</code></td>"
-"  <td style='padding:4px 8px'>airquality CITY</td>"
+"  <td style='padding:4px 8px'>airquality CITY[,State|CC]</td>"
 "  <td style='padding:4px 8px'>last 3 days</td>"
-"  <td style='padding:4px 8px'>Any city name. Shows PM2.5, NO₂, Ozone</td>"
+"  <td style='padding:4px 8px'>Any city. Qualifier: &#34;Houston,TX&#34; &#34;Lyon,FR&#34;. Shows PM2.5, NO₂, Ozone</td>"
 "</tr>"
 "<tr style='border-bottom:1px solid #313244'>"
 "  <td style='padding:4px 8px'><code>gdp</code></td>"
@@ -755,10 +761,14 @@ const char HELP_HTML[] =
 "</tr>"
 "</table>"
 "<p style='color:#45475a;font-size:11px;margin-top:14px'>"
-"Multiple items: add space-separated names for comparison &mdash; "
+"Multiple items: space-separated &mdash; "
 "<code>stock AAPL TSLA NVDA 90</code> &nbsp;"
 "<code>weather London Paris Berlin 14</code> &nbsp;"
 "<code>currency USD EUR GBP JPY 30</code><br>"
+"Multi-word names: quotes or underscores &mdash; <code>weather &#34;San Francisco&#34; New_York Moscow 30</code><br>"
+"Disambiguation: City,State or City,CC &mdash; "
+"<code>weather &#34;Springfield,IL&#34; &#34;Springfield,MO&#34; 14</code> &nbsp;"
+"<code>weather &#34;Paris,FR&#34; &#34;Paris,TX&#34; 30</code><br>"
 "EU alias for GDP expands to: Germany, France, Italy, Spain, Netherlands, Poland<br>"
 "Imperial units: toggle &#xb0;F switch in toolbar (affects weather temperature, precipitation, wind speed)<br>"
 "AI Analysis: requires mshell session with MSHELL_IPC_PID set"
@@ -997,8 +1007,11 @@ int main(int argc, char *argv[]) {
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
 
+#ifndef DANA_APP_ID
+#define DANA_APP_ID "art2dec.dana"
+#endif
     GtkApplication *app = gtk_application_new(
-        "art2dec.dana", G_APPLICATION_DEFAULT_FLAGS);
+        DANA_APP_ID, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     int rc = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
