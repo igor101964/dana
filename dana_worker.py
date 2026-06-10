@@ -1114,13 +1114,46 @@ def save_last_data(query, data):
                 "dates_last":  data.get("dates",[""])[-1] if data.get("dates") else "",
             })
         elif "series" in data:
-            summary["series"] = [
-                {"name": s.get("iso",""),
-                 "min": round(min(s["values"]),2),
-                 "max": round(max(s["values"]),2),
-                 "last": round(s["values"][-1],2)}
-                for s in data["series"] if s.get("values")
-            ]
+            dtype = data.get("type","")
+            if dtype == "gdp":
+                # For GDP include full year-by-year data so AI can analyze trends,
+                # crises (2008-2009, 2020), growth rates, and country comparisons.
+                # Cap at 30 most recent points per country to keep JSON reasonable.
+                def gdp_growth(values):
+                    """Year-over-year growth rates (%)"""
+                    g = []
+                    for i in range(1, len(values)):
+                        if values[i-1] and values[i-1] != 0:
+                            g.append(round((values[i]-values[i-1])/values[i-1]*100, 1))
+                        else:
+                            g.append(None)
+                    return g
+                series_out = []
+                for s in data["series"]:
+                    if not s.get("values"): continue
+                    yrs = s["years"][-30:]
+                    vals = [round(v, 2) for v in s["values"][-30:]]
+                    growth = gdp_growth(vals)
+                    series_out.append({
+                        "country": s.get("iso",""),
+                        "years":   yrs,
+                        "gdp_billion_usd": vals,
+                        "yoy_growth_pct":  growth,
+                        "min":  round(min(vals), 2),
+                        "max":  round(max(vals), 2),
+                        "first": vals[0],
+                        "last":  vals[-1],
+                        "total_growth_pct": round((vals[-1]-vals[0])/vals[0]*100, 1) if vals[0] else None,
+                    })
+                summary["series"] = series_out
+            else:
+                summary["series"] = [
+                    {"name": s.get("iso",""),
+                     "min": round(min(s["values"]),2),
+                     "max": round(max(s["values"]),2),
+                     "last": round(s["values"][-1],2)}
+                    for s in data["series"] if s.get("values")
+                ]
         elif "temp_max" in data:
             t = data["temp_max"]
             summary.update({
