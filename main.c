@@ -123,7 +123,15 @@ static void ipc_connect(void) {
 
 static void ipc_send_raw(const char *json) {
     if (g_ipc_fd_write < 0) return;
-    (void)write(g_ipc_fd_write, json, strlen(json));
+    /* write in 4KB chunks to handle large prompts over pipe */
+    const char *p = json;
+    size_t rem = strlen(json);
+    while (rem > 0) {
+        size_t chunk = rem < 4096 ? rem : 4096;
+        ssize_t w = write(g_ipc_fd_write, p, chunk);
+        if (w <= 0) break;
+        p += w; rem -= (size_t)w;
+    }
     (void)write(g_ipc_fd_write, "\n", 1);
 }
 
@@ -212,7 +220,8 @@ static gboolean  g_imperial     = FALSE; /* FALSE=Metric */
 static GtkWidget *g_lang_dd     = NULL;
 static GtkWidget *g_units_switch= NULL;
 static char      g_last_query[512] = "";
-static char      g_ai_accum[65536];
+static char     *g_ai_accum     = NULL;
+static size_t    g_ai_accum_sz  = 0;
 static int       g_ai_accum_len = 0;
 static guint     g_ai_poll_timer = 0;
 
@@ -336,7 +345,14 @@ static gboolean ai_poll_cb(gpointer ud) {
                     tok += 9;
                     char token[4096];
                     int tl = json_unescape(tok, token, (int)sizeof(token));
-                    if (g_ai_accum_len + tl < (int)sizeof(g_ai_accum)-1) {
+                    /* grow accum dynamically if needed */
+                    if (g_ai_accum == NULL || (size_t)(g_ai_accum_len + tl + 1) > g_ai_accum_sz) {
+                        size_t nsz = g_ai_accum_sz == 0 ? 65536 : g_ai_accum_sz * 2;
+                        while (nsz < (size_t)(g_ai_accum_len + tl + 1)) nsz *= 2;
+                        char *nb = realloc(g_ai_accum, nsz);
+                        if (nb) { g_ai_accum = nb; g_ai_accum_sz = nsz; }
+                    }
+                    if (g_ai_accum && (size_t)(g_ai_accum_len + tl + 1) <= g_ai_accum_sz) {
                         memcpy(g_ai_accum+g_ai_accum_len, token, (size_t)tl);
                         g_ai_accum_len += tl;
                         g_ai_accum[g_ai_accum_len] = '\0';
@@ -349,7 +365,7 @@ static gboolean ai_poll_cb(gpointer ud) {
                 if (txt) { txt+=8; json_unescape(txt, full, (int)sizeof(full)); }
                 if (full[0]) ai_set_text(full);
                 else if (g_ai_accum_len > 0) ai_set_text(g_ai_accum);
-                g_ai_accum_len = 0; g_ai_accum[0] = '\0';
+                g_ai_accum_len = 0; if(g_ai_accum) g_ai_accum[0]='\0';
                 set_status("Analysis done.", "status-ok");
                 gtk_widget_set_sensitive(g_btn_analyze, TRUE);
                 /* clear mshell context memory for all 3 slots */
@@ -397,7 +413,7 @@ static void do_analyze(void) {
         return;
     }
     gtk_widget_set_sensitive(g_btn_analyze, FALSE);
-    g_ai_accum_len = 0; g_ai_accum[0] = '\0';
+    g_ai_accum_len = 0; if(g_ai_accum) g_ai_accum[0]='\0';
     ai_set_text("Analyzing...");
 
     /* build lang prefix for system prompt */
@@ -408,12 +424,13 @@ static void do_analyze(void) {
     /* system prompt — use real newlines */
     char sys_full[1024];
     snprintf(sys_full, sizeof(sys_full),
-        "You are a data analyst. Analyze the provided data briefly:\n"
-        "- Key trends and patterns\n"
-        "- Notable highs, lows, anomalies\n"
-        "- Comparison if multiple series\n"
+        "You are a data analyst. Analyze the provided data concisely:\n"
+        "- IMPORTANT: cover EVERY symbol/city/country in the data - do not skip any\n"
+        "- Summarize by TREND PHASES and key turning points, NOT point-by-point\n"
+        "- Notable highs, lows, anomalies with dates\n"
+        "- Cross-series comparison: relative performance, divergences\n"
         "- One-sentence conclusion\n"
-        "Be concise. Plain text, no markdown.%s",
+        "Plain text, no markdown. 3-6 sentences per series maximum.%s",
         lang_instr);
     char *ep = json_escape(sys_full);
     if (ep) {
@@ -426,27 +443,42 @@ static void do_analyze(void) {
         free(ep);
     }
 
-    /* read last_data.json */
-    char data_json[8192] = "";
-    FILE *jf = fopen(LAST_DATA, "r");
-    if (jf) {
-        int n = (int)fread(data_json, 1, sizeof(data_json)-1, jf);
-        if (n > 0) data_json[n] = '\0';
-        fclose(jf);
+    /* read last_data.json - dynamic buffer, no size limit */
+    char *data_json = NULL;
+    {
+        FILE *jf = fopen(LAST_DATA, "r");
+        if (jf) {
+            fseek(jf, 0, SEEK_END);
+            long fsz = ftell(jf);
+            rewind(jf);
+            if (fsz > 0 && fsz < 512*1024) {
+                data_json = malloc(fsz + 1);
+                if (data_json) {
+                    int n = (int)fread(data_json, 1, fsz, jf);
+                    data_json[n > 0 ? n : 0] = '\0';
+                }
+            }
+            fclose(jf);
+        }
+        if (!data_json) { data_json = malloc(1); if(data_json) data_json[0]='\0'; }
     }
 
-    /* build prompt — include lang instruction here too for reliability */
-    char prompt[8192];
-    if (data_json[0])
-        snprintf(prompt, sizeof(prompt),
-            "Query: %s\nData: %.5000s\n"
-            "Analyze this data. Respond in %s.",
-            g_last_query, data_json, LANGUAGES[g_lang_idx]);
-    else
-        snprintf(prompt, sizeof(prompt),
-            "Query: %s\nDescribe what insights a user might expect. "
-            "Respond in %s.",
-            g_last_query, LANGUAGES[g_lang_idx]);
+    /* build prompt - dynamic, full JSON, no truncation */
+    char *prompt = NULL;
+    {
+        int psize = (int)strlen(g_last_query) + (int)strlen(data_json) + 256;
+        prompt = malloc(psize);
+        if (prompt) {
+            if (data_json[0])
+                snprintf(prompt, psize,
+                    "Query: %s\nData: %s\nAnalyze this data. Respond in %s.",
+                    g_last_query, data_json, LANGUAGES[g_lang_idx]);
+            else
+                snprintf(prompt, psize,
+                    "Query: %s\nDescribe what insights a user might expect. Respond in %s.",
+                    g_last_query, LANGUAGES[g_lang_idx]);
+        }
+    }
 
     ipc_set_provider(g_current_slot);
     ep = json_escape(prompt);
@@ -464,6 +496,8 @@ static void do_analyze(void) {
         free(ep);
     }
     set_status("AI analyzing...", "status-busy");
+    free(data_json);
+    free(prompt);
     if (!g_ai_poll_timer)
         g_ai_poll_timer = g_timeout_add(50, ai_poll_cb, NULL);
 }

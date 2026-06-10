@@ -866,6 +866,74 @@ def nice_error_html(title, message, hint=None):
 </div></body></html>"""
 
 
+# ── Data helpers used by handle() and save_last_data() ───────────────────
+
+# ── AI data budget ───────────────────────────────────────────────────────
+# last_data.json is sent as input tokens to the AI model on every analysis.
+# To keep token costs predictable, we cap series length and total file size.
+AI_SERIES_CAP  = 30        # max data points per symbol/city/country
+AI_JSON_MAX_KB = 20        # hard limit on last_data.json size in KB
+
+def _series_rows(d, cap=AI_SERIES_CAP):
+    """Downsample a values/dates series to at most cap points for AI summary.
+    Cap defaults to AI_SERIES_CAP (30) — enough to see all trends and anomalies
+    while keeping token costs low (~1KB per symbol, ~$0.004 per analysis call).
+    """
+    dates = d.get("dates", [])
+    vals  = d.get("values", [])
+    if not dates or not vals:
+        return []
+    step  = max(1, len(dates) // cap)
+    rows  = [{"date": dates[i], "value": round(vals[i], 4)}
+             for i in range(0, len(dates), step) if i < len(vals)][-cap:]
+    return rows
+
+def _weather_days(d):
+    """Build per-day list from a single-city weather dict."""
+    rows = []
+    for i, dt in enumerate(d.get("dates", [])):
+        row = {"date": dt}
+        tm = d.get("temp_max", []); tn = d.get("temp_min", [])
+        pr = d.get("precip", []);   wn = d.get("wind", [])
+        if i < len(tm) and tm[i] is not None: row["temp_max"]  = round(tm[i], 1)
+        if i < len(tn) and tn[i] is not None: row["temp_min"]  = round(tn[i], 1)
+        if i < len(pr) and pr[i] is not None: row["precip_mm"] = round(pr[i], 1)
+        if i < len(wn) and wn[i] is not None: row["wind_max"]  = round(wn[i], 1)
+        rows.append(row)
+    return rows
+
+def _aq_stats(d):
+    """Build air-quality stats + hourly PM2.5 sample for one city."""
+    def _s(key):
+        vals = [v for v in d.get(key, []) if v is not None and v > 0]
+        if not vals:
+            return {"avg": None, "max": None, "min": None}
+        return {"avg": round(sum(vals)/len(vals), 1),
+                "max": round(max(vals), 1),
+                "min": round(min(vals), 1)}
+    times = d.get("raw_time", [])
+    pm25r = d.get("raw_pm25", [])
+    hourly = [{"t": times[i], "pm25": round(pm25r[i], 1)}
+              for i in range(0, len(times), 3)
+              if i < len(pm25r) and pm25r[i] is not None]
+    return {"title": d.get("title",""),
+            "period": f"{times[0]} to {times[-1]}" if times else "",
+            "pm25": _s("raw_pm25"),
+            "no2":  _s("raw_no2"),
+            "o3":   _s("raw_o3"),
+            "hourly_pm25": hourly}
+
+def _gdp_growth(values):
+    """Year-over-year growth rates (%) for a GDP series."""
+    g = []
+    for i in range(1, len(values)):
+        if values[i-1] and values[i-1] != 0:
+            g.append(round((values[i]-values[i-1])/values[i-1]*100, 1))
+        else:
+            g.append(None)
+    return g
+
+
 def handle(query):
     global g_units, g_lang, _last_raw_data
     _last_raw_data = None
@@ -920,7 +988,8 @@ def handle(query):
                       "max":round(max(d["values"]),4) if d.get("values") else None,
                       "change_pct":round((d["values"][-1]-d["values"][0])/d["values"][0]*100,2) if d.get("values") and d["values"][0] else None,
                       "dates_first":d["dates"][0] if d.get("dates") else "",
-                      "dates_last":d["dates"][-1] if d.get("dates") else ""}
+                      "dates_last":d["dates"][-1] if d.get("dates") else "",
+                      "series": _series_rows(d)}
                      for d in multi_data]
         }
         title = f"Stocks comparison (normalised, base=100): {', '.join(syms)}"
@@ -954,7 +1023,8 @@ def handle(query):
                       "max":round(max(d["values"]),4) if d.get("values") else None,
                       "change_pct":round((d["values"][-1]-d["values"][0])/d["values"][0]*100,2) if d.get("values") and d["values"][0] else None,
                       "dates_first":d["dates"][0] if d.get("dates") else "",
-                      "dates_last":d["dates"][-1] if d.get("dates") else ""}
+                      "dates_last":d["dates"][-1] if d.get("dates") else "",
+                      "series": _series_rows(d)}
                      for d in multi_data]
         }
         title = f"Crypto comparison (normalised): {', '.join(c.capitalize() for c in coins)}"
@@ -978,11 +1048,13 @@ def handle(query):
             traces.append((d["title"].replace("Weather in ",""), d["dates"], d["temp_max"]))
         _last_raw_data = {
             "type": "weather_multi",
+            "temp_unit": multi_data[0].get("temp_label","°C") if multi_data else "°C",
             "cities": [d["title"] for d in multi_data],
-            "data": [{"title":d["title"],
-                      "temp_max_avg": round(sum(v for v in d["temp_max"] if v is not None)/max(1,len([v for v in d["temp_max"] if v is not None])),1),
+            "data": [{"title": d["title"],
+                      "temp_max_avg":  round(sum(v for v in d["temp_max"] if v is not None)/max(1,len([v for v in d["temp_max"] if v is not None])),1),
                       "temp_max_peak": max((v for v in d["temp_max"] if v is not None), default=None),
-                      "precip_total": round(sum(v for v in d["precip"] if v is not None),1)}
+                      "precip_total":  round(sum(v for v in d["precip"] if v is not None),1),
+                      "days": _weather_days(d)}
                      for d in multi_data]
         }
         title = f"Temperature comparison ({tl} max): {', '.join(cities)}"
@@ -1014,7 +1086,10 @@ def handle(query):
                       "last":round(d["values"][-1],4) if d.get("values") else None,
                       "min":round(min(d["values"]),4) if d.get("values") else None,
                       "max":round(max(d["values"]),4) if d.get("values") else None,
-                      "change_pct":round((d["values"][-1]-d["values"][0])/d["values"][0]*100,2) if d.get("values") and d["values"][0] else None}
+                      "change_pct":round((d["values"][-1]-d["values"][0])/d["values"][0]*100,2) if d.get("values") and d["values"][0] else None,
+                      "dates_first":d["dates"][0] if d.get("dates") else "",
+                      "dates_last":d["dates"][-1] if d.get("dates") else "",
+                      "series": _series_rows(d)}
                      for t,d in multi_data]
         }
         title = f"{base} exchange rates: {', '.join(targets)}"
@@ -1038,12 +1113,7 @@ def handle(query):
         _last_raw_data = {
             "type": "airquality_multi",
             "cities": [d["title"] for d in multi_data],
-            "data": [{"title":d["title"],
-                      "pm25_avg": round(sum(v for v in d.get("raw_pm25",[]) if v)/max(1,len([v for v in d.get("raw_pm25",[]) if v])),1) if d.get("raw_pm25") else None,
-                      "pm25_max": round(max((v for v in d.get("raw_pm25",[]) if v), default=0),1),
-                      "no2_avg":  round(sum(v for v in d.get("raw_no2",[]) if v)/max(1,len([v for v in d.get("raw_no2",[]) if v])),1) if d.get("raw_no2") else None,
-                      "o3_avg":   round(sum(v for v in d.get("raw_o3",[]) if v)/max(1,len([v for v in d.get("raw_o3",[]) if v])),1) if d.get("raw_o3") else None}
-                     for d in multi_data]
+            "data": [_aq_stats(d) for d in multi_data]
         }
         title = f"Air quality PM2.5 comparison: {', '.join(cities)}"
         return multi_chart_html(traces, title, "PM2.5 μg/m³")
@@ -1103,15 +1173,21 @@ def save_last_data(query, data):
             if "cities"  in data: summary["cities"]  = data["cities"]
             if "base"    in data: summary["base"]     = data["base"]
         elif "values" in data:
-            v = data["values"]
+            v     = data["values"]
+            dates = data.get("dates",[])
+            # downsample to max 90 pts for AI (avoids huge JSON for 365-day queries)
+            step  = max(1, len(v)//90)
+            series = [{"date":dates[i],"value":round(v[i],4)}
+                      for i in range(0,len(v),step) if i < len(dates)][-90:]
             summary.update({
                 "count": len(v), "min": round(min(v),4) if v else None,
                 "max": round(max(v),4) if v else None,
                 "first": round(v[0],4) if v else None,
                 "last": round(v[-1],4) if v else None,
                 "change_pct": round((v[-1]-v[0])/v[0]*100,2) if v and v[0] else None,
-                "dates_first": data.get("dates",[""])[0],
-                "dates_last":  data.get("dates",[""])[-1] if data.get("dates") else "",
+                "dates_first": dates[0] if dates else "",
+                "dates_last":  dates[-1] if dates else "",
+                "series": series,
             })
         elif "series" in data:
             dtype = data.get("type","")
@@ -1119,21 +1195,12 @@ def save_last_data(query, data):
                 # For GDP include full year-by-year data so AI can analyze trends,
                 # crises (2008-2009, 2020), growth rates, and country comparisons.
                 # Cap at 30 most recent points per country to keep JSON reasonable.
-                def gdp_growth(values):
-                    """Year-over-year growth rates (%)"""
-                    g = []
-                    for i in range(1, len(values)):
-                        if values[i-1] and values[i-1] != 0:
-                            g.append(round((values[i]-values[i-1])/values[i-1]*100, 1))
-                        else:
-                            g.append(None)
-                    return g
                 series_out = []
                 for s in data["series"]:
                     if not s.get("values"): continue
-                    yrs = s["years"][-30:]
-                    vals = [round(v, 2) for v in s["values"][-30:]]
-                    growth = gdp_growth(vals)
+                    yrs = s["years"][-AI_SERIES_CAP:]
+                    vals = [round(v, 2) for v in s["values"][-AI_SERIES_CAP:]]
+                    growth = _gdp_growth(vals)
                     series_out.append({
                         "country": s.get("iso",""),
                         "years":   yrs,
@@ -1155,11 +1222,29 @@ def save_last_data(query, data):
                     for s in data["series"] if s.get("values")
                 ]
         elif "temp_max" in data:
-            t = data["temp_max"]
+            # Single-city weather — include full day-by-day data for AI analysis
+            dates    = data.get("dates", [])
+            tmax     = data.get("temp_max", [])
+            tmin     = data.get("temp_min", [])
+            precip   = data.get("precip", [])
+            wind     = data.get("wind", [])
+            days_out = []
+            for i, d in enumerate(dates):
+                row = {"date": d}
+                if i < len(tmax) and tmax[i] is not None: row["temp_max"] = round(tmax[i],1)
+                if i < len(tmin) and tmin[i] is not None: row["temp_min"] = round(tmin[i],1)
+                if i < len(precip) and precip[i] is not None: row["precip_mm"] = round(precip[i],1)
+                if i < len(wind)   and wind[i]   is not None: row["wind_max"]  = round(wind[i],1)
+                days_out.append(row)
+            t = tmax
             summary.update({
-                "temp_max_avg":  round(sum(t)/len(t),1) if t else None,
-                "temp_max_peak": round(max(t),1) if t else None,
-                "precip_total":  round(sum(p for p in data.get("precip",[]) if p),1),
+                "temp_unit":     data.get("temp_label","°C"),
+                "wind_unit":     data.get("wind_label","km/h"),
+                "precip_unit":   data.get("precip_label","mm"),
+                "temp_max_avg":  round(sum(v for v in t if v is not None)/len(t),1) if t else None,
+                "temp_max_peak": round(max(v for v in t if v is not None),1) if t else None,
+                "precip_total":  round(sum(p for p in precip if p),1),
+                "days":          days_out,
             })
         elif "flights" in data:
             countries = {}
@@ -1168,13 +1253,17 @@ def save_last_data(query, data):
             summary["aircraft_count"] = len(data["flights"])
             summary["top_countries"]  = sorted(countries.items(), key=lambda x:-x[1])[:5]
         elif "pm25" in data:
-            # airquality — save hourly values sample + stats
-            pm25 = [v for v in data.get("raw_pm25",[]) if v is not None]
-            no2  = [v for v in data.get("raw_no2",[])  if v is not None]
-            o3   = [v for v in data.get("raw_o3",[])   if v is not None]
+            # airquality single — full stats + hourly sample (every 3h)
+            pm25  = [v for v in data.get("raw_pm25",[]) if v is not None]
+            no2   = [v for v in data.get("raw_no2",[])  if v is not None]
+            o3    = [v for v in data.get("raw_o3",[])   if v is not None]
             times = data.get("raw_time", [])
+            pm25r = data.get("raw_pm25",[])
+            hourly = [{"t":times[i],"pm25":round(pm25r[i],1)}
+                      for i in range(0,len(times),3)
+                      if i < len(pm25r) and pm25r[i] is not None]
             summary.update({
-                "period": f"{times[0]} to {times[-1]}" if times else "",
+                "period":    f"{times[0]} to {times[-1]}" if times else "",
                 "pm25_avg":  round(sum(pm25)/len(pm25),1) if pm25 else None,
                 "pm25_max":  round(max(pm25),1) if pm25 else None,
                 "pm25_min":  round(min(pm25),1) if pm25 else None,
@@ -1183,9 +1272,26 @@ def save_last_data(query, data):
                 "o3_avg":    round(sum(o3)/len(o3),1) if o3 else None,
                 "o3_max":    round(max(o3),1) if o3 else None,
                 "samples":   len(pm25),
+                "hourly_pm25": hourly,
             })
+        # Hard cap: if summary exceeds AI_JSON_MAX_KB, trim series arrays equally
+        raw = json.dumps(summary)
+        if len(raw) > AI_JSON_MAX_KB * 1024:
+            # trim each series list proportionally until fits
+            for trim_cap in (20, 15, 10, 7, 5):
+                for key in ("series", "days", "hourly_pm25"):
+                    if isinstance(summary.get(key), list):
+                        summary[key] = summary[key][-trim_cap:]
+                    elif isinstance(summary.get("data"), list):
+                        for item in summary["data"]:
+                            for k in ("series", "days", "hourly_pm25"):
+                                if isinstance(item.get(k), list):
+                                    item[k] = item[k][-trim_cap:]
+                raw = json.dumps(summary)
+                if len(raw) <= AI_JSON_MAX_KB * 1024:
+                    break
         with open(LAST_DATA_FILE, "w") as f:
-            json.dump(summary, f)
+            f.write(raw)
     except Exception:
         pass
 
